@@ -1,63 +1,101 @@
-from keras.layers.core import *
-from keras.layers.embeddings import Embedding
-from keras.models import Sequential
-from keras.optimizers import *
-from keras.objectives import *
-from keras.constraints import *
-from keras.regularizers import *
-from keras.layers.recurrent import *
-from keras.layers.advanced_activations import LeakyReLU
+import autograd.numpy as np
+import cPickle as pkl
+from pystacks.param import ParamServer
+from pystacks.layers.recurrent import LSTMMemoryLayer
+from pystacks.layers.embedding import LookupTable
+from pystacks.regularizers import Dropout
+from pystacks.layers.core import Dense
+from pystacks.layers.activations import LogSoftmax
+from pystacks.initialization import Hardcode
+from pystacks.optimizers import *
+from pystacks.utils.logging import Progbar
+from pystacks.utils.math import make_batches_by_len
+from pystacks.grad_transformer import *
+from pystacks.utils.text import Vocab, Senna
+from pystacks.utils.math import one_hot, make_batches_by_len
 
-def get_model(num_word, num_label, emb_dim=50, hid_dim=[300], dropout=False, activation='tanh', reg=1e-3, preinit=None, truncate=7):
-    word_emb = Embedding(num_word, emb_dim, W_constraint=unitnorm)
-    model = Sequential()
-    model.add(word_emb)
-    model.add(GRU(emb_dim, hid_dim[0], truncate_gradient=truncate))
-    n_in = n_out = hid_dim[0]
-    for n_out in hid_dim[1:]:
-        model.add(Dense(n_in, n_out, W_regularizer=l2(reg)))
-        model.add(Activation('tanh'))
-        if dropout:
-            model.add(Dropout(0.5))
-        n_in = n_out
-    model.add(Dense(n_out, num_label))
-    model.add(Activation('softmax'))
-    return model
+from pprint import pprint
+from time import time
+from autograd import value_and_grad
+from autograd.util import quick_grad_check
+
+from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
 
 if __name__ == '__main__':
-    import json
+    with open('numericalized.pkl') as f:
+        train, dev, test, word_vocab, rel_vocab = pkl.load(f)
 
-    max_epoch = 100
+    state_size = 64
+    emb_size = 50
+    num_epoch = 10
+    learning_rate = 1.0
+    batch_size = 128
+    np.random.seed(1)
 
-    from dataset import Dataset
-    dataset = Dataset()
-    model = get_model(len(dataset.word_vocab), len(dataset.label_vocab), dropout=True, truncate=20)
-    model.compile(optimizer='adagrad', loss='categorical_crossentropy')
+    server = ParamServer()
 
-    log = open('train.log', 'wb')
+    lookup_layer = LookupTable(len(word_vocab), emb_size)
+    lookup_layer.E.init = Hardcode(word_vocab.load_embeddings())
+    lookup_layer.register_params(server)
+    lstm_layer = LSTMMemoryLayer(emb_size, state_size, dropout=Dropout(0.1)).register_params(server)
 
-    for epoch in range(max_epoch):
-        loss, acc, total = 0, 0, 0
-        for x, y, in dataset.train:
-            loss_, acc_ = model.train(x, y, accuracy=True)
-            loss += loss_ * len(x)
-            acc += acc_ * len(x)
-            total += len(x)
-        loss /= float(total)
-        acc /= float(total)
-        l = {'epoch': epoch, 'train_loss': loss, 'train_acc': acc}
+    rel_output_layer = Dense(state_size, len(rel_vocab)).register_params(server)
+    rel_softmax_layer = LogSoftmax().register_params(server)
 
-        loss, acc, total = 0, 0, 0
-        for x, y, in dataset.dev:
-            loss_, acc_ = model.train(x, y, accuracy=True)
-            loss += loss_ * len(x)
-            acc += acc_ * len(x)
-            total += len(x)
-        loss /= float(total)
-        acc /= float(total)
-        l.update({'dev_loss': loss, 'dev_acc': acc})
+    server.finalize()
 
-        p = json.dumps(l, sort_keys=True)
-        print p
-        log.write(p + "\n")
+    def pred_fun(weights, x, train=False):
+        server.param_vector = weights
+        ht, ct = None, None
+        for t in xrange(x.shape[1]):
+            emb = lookup_layer.forward(x[:, t], train=train)
+            ht, ct = lstm_layer.forward(emb, ht, ct, train=train)
+            pt_rel = rel_output_layer.forward(ht)
+        return rel_softmax_layer.forward(pt_rel)
 
+    def loss_fun(weights, x, targets, train=False):
+        logprobs_rel = pred_fun(weights, x, train=train)
+        loss_sum = - np.sum(logprobs_rel * targets)
+        return loss_sum / float(x.shape[0])
+
+    def score(weights, inputs, targets, train=False):
+        targs = np.argmax(targets, axis=-1)
+        logprobs_rel = pred_fun(weights, inputs, train)
+        preds = np.argmax(logprobs_rel, axis=-1)
+        acc = accuracy_score(targs, preds)
+        return targs, preds, acc
+
+    # Build gradient of loss function using autograd.
+    loss_and_grad = value_and_grad(loss_fun)
+
+    # Check the gradients numerically, just to be safe
+    xsmall, ysmall = np.array(train[0][0]).reshape(1, -1), one_hot(np.array(train[0][1]).reshape(1, -1), len(rel_vocab))
+    quick_grad_check(loss_fun, server.param_vector, (xsmall, ysmall))
+
+    print("Training LSTM...")
+    optimizer = Adam()
+    start = time()
+    for epoch in xrange(1, num_epoch+1):
+        epoch_loss = 0.
+        batches = make_batches_by_len([len(x) for x in train[0]], batch_size)
+        print 'epoch', epoch
+        bar = Progbar(len(train[0]), 'train', track=['loss', 'acc'])
+        for batch in batches:
+            x, y = np.array([train[0][i] for i in batch], dtype='int32'), one_hot(np.array([train[1][i] for i in batch], dtype='int32'), len(rel_vocab))
+            loss, dparams = loss_and_grad(server.param_vector, x, y, train=True)
+            epoch_loss += loss
+            server.update_params(optimizer, dparams, learning_rate)
+            targs_, preds_, acc = score(server.param_vector, x, y, train=False)
+            bar.update(len(y), new_values={'loss':loss, 'acc':acc})
+        bar.finish()
+
+        batches = make_batches_by_len([len(x) for x in dev[0]], batch_size)
+        bar = Progbar(len(dev[0]), 'eval', track=['acc'])
+        for batch in batches:
+            x, y = np.array([dev[0][i] for i in batch], dtype='int32'), one_hot(np.array([dev[1][i] for i in batch], dtype='int32'), len(rel_vocab))
+            targs_, preds_, acc = score(server.param_vector, x, y, train=False)
+            bar.update(len(y), new_values={'acc':acc})
+        bar.finish()
+
+        print("epoch %s train loss %s in %s" % (epoch, epoch_loss, time() - start))
+        start = time()

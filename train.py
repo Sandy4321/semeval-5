@@ -72,6 +72,16 @@ if __name__ == '__main__':
     xsmall, ysmall = np.array(train[0][0]).reshape(1, -1), one_hot(np.array(train[0][1]).reshape(1, -1), len(rel_vocab))
     quick_grad_check(loss_fun, server.param_vector, (xsmall, ysmall))
 
+    def evaluate(split, name='dev'):
+        batches = make_batches_by_len([len(x) for x in split[0]], batch_size)
+        targs, preds = [], []
+        for batch in batches:
+            x, y = np.array([split[0][i] for i in batch], dtype='int32'), one_hot(np.array([split[1][i] for i in batch], dtype='int32'), len(rel_vocab))
+            targs_, preds_, acc = score(server.param_vector, x, y, train=False)
+            targs.append(targs_)
+            preds.append(preds_)
+        print name, 'acc', np.mean(np.concatenate(targs) == np.concatenate(preds))
+
     print("Training LSTM...")
     optimizer = Adam()
     start = time()
@@ -89,13 +99,10 @@ if __name__ == '__main__':
             bar.update(len(y), new_values={'loss':loss, 'acc':acc})
         bar.finish()
 
-        batches = make_batches_by_len([len(x) for x in dev[0]], batch_size)
-        bar = Progbar(len(dev[0]), 'eval', track=['acc'])
-        for batch in batches:
-            x, y = np.array([dev[0][i] for i in batch], dtype='int32'), one_hot(np.array([dev[1][i] for i in batch], dtype='int32'), len(rel_vocab))
-            targs_, preds_, acc = score(server.param_vector, x, y, train=False)
-            bar.update(len(y), new_values={'acc':acc})
-        bar.finish()
+        evaluate(train, 'train')
+        evaluate(dev, 'dev')
 
         print("epoch %s train loss %s in %s" % (epoch, epoch_loss, time() - start))
         start = time()
+
+    evaluate(test, 'test')

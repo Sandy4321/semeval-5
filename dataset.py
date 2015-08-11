@@ -15,9 +15,9 @@ def numericalize(fname, vocabs, train=False):
     word_vocab, rel_vocab = vocabs
 
     def process_cache():
-        sentence = cache[0].strip("\n").lower()
+        sentence = cache[0].strip("\n\r").lower()
         sentence = sentence.replace('<e1>', 'E1BEGIN ').replace('<e2>', 'E2BEGIN ').replace('</e1>', ' E1END').replace('</e2>', ' E2END')
-        label = cache[1].strip("\n")
+        label = cache[1].strip("\n\r")
         sentence = sentence.split("\t")[1].strip('"').split()
         tokens = word_vocab.sent2index(sentence, add=train)
         X.append(tokens)
@@ -33,7 +33,7 @@ def numericalize(fname, vocabs, train=False):
     return X, Y
 
 if __name__ == '__main__':
-    word_vocab, rel_vocab = vocabs = Senna('/Users/victor/Developer/pystacks/examples/data/senna'), Vocab()
+    word_vocab, rel_vocab = vocabs = Senna('dataset/senna'), Vocab()
     train = numericalize(trainfile, vocabs, True)
     dev = numericalize(devfile, vocabs)
     test = numericalize(testfile, vocabs)

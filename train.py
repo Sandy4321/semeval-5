@@ -25,11 +25,13 @@ if __name__ == '__main__':
     with open('numericalized.pkl') as f:
         train, dev, test, word_vocab, rel_vocab = pkl.load(f)
 
-    state_size = 64
+    state_size = 500
     emb_size = 50
-    num_epoch = 10
+    num_epoch = 30
     learning_rate = 1.0
     batch_size = 128
+    pool = True
+
     np.random.seed(1)
 
     server = ParamServer()
@@ -37,7 +39,7 @@ if __name__ == '__main__':
     lookup_layer = LookupTable(len(word_vocab), emb_size)
     lookup_layer.E.init = Hardcode(word_vocab.load_embeddings())
     lookup_layer.register_params(server)
-    lstm_layer = LSTMMemoryLayer(emb_size, state_size, dropout=Dropout(0.1)).register_params(server)
+    lstm_layer = LSTMMemoryLayer(emb_size, state_size, dropout=Dropout(0.5)).register_params(server)
 
     rel_output_layer = Dense(state_size, len(rel_vocab)).register_params(server)
     rel_softmax_layer = LogSoftmax().register_params(server)
@@ -47,10 +49,15 @@ if __name__ == '__main__':
     def pred_fun(weights, x, train=False):
         server.param_vector = weights
         ht, ct = None, None
+        h_cache = None
         for t in xrange(x.shape[1]):
             emb = lookup_layer.forward(x[:, t], train=train)
             ht, ct = lstm_layer.forward(emb, ht, ct, train=train)
-            pt_rel = rel_output_layer.forward(ht)
+            if pool:
+              h_cache = ht if h_cache is None else np.maximum(h_cache, ht)
+        if pool:
+          ht = h_cache
+        pt_rel = rel_output_layer.forward(ht)
         return rel_softmax_layer.forward(pt_rel)
 
     def loss_fun(weights, x, targets, train=False):
@@ -69,7 +76,7 @@ if __name__ == '__main__':
     loss_and_grad = value_and_grad(loss_fun)
 
     # Check the gradients numerically, just to be safe
-    xsmall, ysmall = np.array(train[0][0]).reshape(1, -1), one_hot(np.array(train[0][1]).reshape(1, -1), len(rel_vocab))
+    xsmall, ysmall = np.array(train[0][0]).reshape(1, -1), one_hot(np.array(train[1][0]).reshape(1, -1), len(rel_vocab))
     quick_grad_check(loss_fun, server.param_vector, (xsmall, ysmall))
 
     def evaluate(split, name='dev'):

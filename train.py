@@ -9,7 +9,6 @@ from pystacks.layers.activations import LogSoftmax
 from pystacks.initialization import Hardcode
 from pystacks.optimizers import *
 from pystacks.utils.logging import Progbar
-from pystacks.utils.math import make_batches_by_len
 from pystacks.grad_transformer import *
 from pystacks.utils.text import Vocab, Senna
 from pystacks.utils.math import one_hot, make_batches_by_len
@@ -21,6 +20,11 @@ from autograd.util import quick_grad_check
 
 from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
 
+def softmax(x):
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / np.sum(e, axis=-1, keepdims=True)
+
 if __name__ == '__main__':
     with open('numericalized.pkl') as f:
         train, dev, test, word_vocab, rel_vocab = pkl.load(f)
@@ -31,6 +35,7 @@ if __name__ == '__main__':
     learning_rate = 1.0
     batch_size = 128
     pool = True
+    attention = True
 
     np.random.seed(1)
 
@@ -44,14 +49,30 @@ if __name__ == '__main__':
     rel_output_layer = Dense(state_size, len(rel_vocab)).register_params(server)
     rel_softmax_layer = LogSoftmax().register_params(server)
 
+    attention_layer = Dense(state_size + emb_size, 1).register_params(server)
+    attention_softmax = LogSoftmax().register_params(server)
+
     server.finalize()
 
     def pred_fun(weights, x, train=False):
         server.param_vector = weights
-        ht, ct = None, None
+        ht, ct = lstm_layer.h0.fetch(), lstm_layer.c0.fetch()
         h_cache = None
+
+        emb_through_time = []
         for t in xrange(x.shape[1]):
-            emb = lookup_layer.forward(x[:, t], train=train)
+            emb_through_time.append(lookup_layer.forward(x[:, t], train=train))
+        emb_through_time = np.array(emb_through_time)
+
+        for t in xrange(x.shape[1]):
+            if attention:
+                attn_mem = np.outer(np.ones(x.shape[0]), ht)
+                emb = np.zeros((x.shape[0], emb_size))
+                for j in xrange(x.shape[1]):
+                    attn_score = attention_layer.forward(np.concatenate([attn_mem, emb_through_time[j]], axis=1))
+                    emb = emb + attn_score * emb_through_time[j]
+            else:
+                emb = emb_through_time[t]
             ht, ct = lstm_layer.forward(emb, ht, ct, train=train)
             if pool:
               h_cache = ht if h_cache is None else np.maximum(h_cache, ht)
@@ -107,7 +128,7 @@ if __name__ == '__main__':
         bar.finish()
 
         evaluate(train, 'train')
-        evaluate(dev, 'dev')
+        evaluate(test, 'test')
 
         print("epoch %s train loss %s in %s" % (epoch, epoch_loss, time() - start))
         start = time()

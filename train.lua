@@ -3,29 +3,62 @@ require 'nngraph'
 require 'autobw'
 require 'math'
 require 'optim'
+require 'torchlib'
+require 'xlua'
 
-local n_vocab = 10
-local n_emb = 3
-local n_output = 4
-local n_hidden = 5
+local vocab = torch.load('vocabs.t7')
+local n_vocab = vocab.word:size()
+local n_emb = 50
+local n_output = vocab.rel:size()
+local n_hidden = 128
+local n_epoch = 10
 local batch_size = 1
-local seq_length = 5
+
+local train = torch.load('train.t7')
+local iter = 1
+
+torch.manualSeed(123)
+
+local function subsample(data, n)
+  local subx = {}
+  local suby = {}
+  local total = #data.X
+  for i = 1, n do
+    local subi = math.ceil(math.random() * total)
+    table.insert(subx, data.X[subi])
+    table.insert(suby, data.Y[subi])
+  end
+  return {X=subx, Y=suby}
+end
+
+--train = subsample(train, 100)
 
 local function make_rnn_layer(n_input, n_hidden)
     local x = nn.Identity()()
     local prev_c = nn.Identity()()
     local prev_h = nn.Identity()()
 
-    function new_input_sum()
+    function new_input_sum(is_forget)
         -- transforms input
-        local i2h            = nn.Linear(n_input, n_hidden)(x)
+        local i2h_linear     = nn.Linear(n_input, n_hidden)
         -- transforms previous timestep's output
-        local h2h            = nn.Linear(n_hidden, n_hidden)(prev_h)
+        local h2h_linear     = nn.Linear(n_hidden, n_hidden)
+        -- initialize
+        i2h_linear.weight:uniform(-0.1, 0.1)
+        i2h_linear.bias:zero()
+        h2h_linear.weight:eye(n_hidden):mul(0.8)
+        h2h_linear.bias:zero()
+        if is_forget then
+          h2h_linear.bias:add(1)
+        end
+
+        local i2h            = i2h_linear(x)
+        local h2h            = h2h_linear(prev_h)
         return nn.CAddTable()({i2h, h2h})
     end
 
     local in_gate          = nn.Sigmoid()(new_input_sum())
-    local forget_gate      = nn.Sigmoid()(new_input_sum())
+    local forget_gate      = nn.Sigmoid()(new_input_sum(true))
     local out_gate         = nn.Sigmoid()(new_input_sum())
     local in_transform     = nn.Tanh()(new_input_sum())
 
@@ -115,20 +148,23 @@ local model = {
     end
 }
 
-local X = {}
-local Y = {}
+-- initialize
+local function glorot(W)
+  local n_in = W:size(1)
+  local n_out = W:size(2)
+  local bound = torch.sqrt(6. / (n_in + n_out))
+  return W:uniform(-bound, bound)
+end
 
-local data = torch.IntTensor{
-  {1, 2, 3},
-  {2, 3, 4},
-  {3, 4, 1},
-}
+model.lookup.weight:uniform(-0.1, 0.1)
+for l = 1, #model.layers do
+  model.initial[l].weight:zero()
+end
+glorot(model.output.weight)
+model.output.bias:zero()
 
-local labels = torch.IntTensor{4, 1, 2}
-local iter = 1
-
+-- define train/test functions
 local params, grads = model:get_parameters()
-params:uniform(-0.1, 0.1)
 
 local function fopt(x)
     if params ~= x then
@@ -136,18 +172,41 @@ local function fopt(x)
     end
     grads:zero()
 
-    local x = data[iter]
-    local y = labels[iter]
-    iter = ((iter + 1) % data:size(1)) + 1
+    local ind = math.ceil(math.random() * #train.X)
+    local x = train.X[ind]
+    local y = train.Y[ind]
+    iter = (iter % #train.X) + 1
 
     local loss, acc = model:forward(x, y)
     model:backward()
-    print('loss', loss, 'acc', acc)
+    --print('loss', loss, 'acc', acc)
 
     return loss, grads
 end
 
-for i = 1, 100 do
-    local _, fx = optim.rmsprop(fopt, params, {learningRate=1e-2})
+local function fpredict(data)
+  local total_loss = 0
+  local total_acc = 0
+  for i = 1, #data.X do
+    local x = data.X[i]
+    local y = data.Y[i]
+    local loss, acc = model:forward(x, y)
+    total_loss = total_loss + loss
+    total_acc = total_acc + acc
+  end
+  return total_loss / #data.X, total_acc / #data.X
+end
+
+for epoch = 1, n_epoch do
+    -- train epoch
+    optim.rmsprop(fopt, params, {learningRate=1e-2})
+    xlua.progress(iter, #train.X)
+    while iter ~= 1 do
+      _, fx = optim.rmsprop(fopt, params, {learningRate=1e-2})
+      xlua.progress(iter, #train.X)
+    end
+    -- evaluate
+    local loss, acc = fpredict(train)
+    print('epoch', epoch, 'loss', loss, 'acc', acc)
 end
 

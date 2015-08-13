@@ -67,14 +67,18 @@ local Xdev, Ydev = readFile('dataset/dev.txt', vocabs, false)
 print('numericalizing test data')
 local Xtest, Ytest = readFile('dataset/test.txt', vocabs, false)
 
-print('train ' .. #Xtrain)
-print('dev ' .. #Xdev)
-print('test ' .. #Xtest)
-print('words ' .. vocabs.word:size())
-print('rel ' .. vocabs.rel:size())
+local emb = vocabs.word:pretrained('senna')
+
+print('train', #Xtrain)
+print('dev', #Xdev)
+print('test', #Xtest)
+print('words', vocabs.word:size())
+print('rel', vocabs.rel:size())
+print('emb shape', emb:size()) 
 
 torch.save('vocabs.t7', vocabs)
 torch.save('train.t7', {X=Xtrain, Y=Ytrain})
 torch.save('dev.t7', {X=Xdev, Y=Ydev})
 torch.save('test.t7', {X=Xtest, Y=Ytest})
+torch.save('senna.t7', emb)
 

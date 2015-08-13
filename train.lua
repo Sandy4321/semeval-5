@@ -6,6 +6,8 @@ require 'optim'
 require 'torchlib'
 require 'xlua'
 
+torch.setdefaulttensortype('torch.FloatTensor')
+
 local vocab = torch.load('vocabs.t7')
 local n_vocab = vocab.word:size()
 local n_emb = 50
@@ -14,6 +16,7 @@ local n_hidden = 128
 local n_epoch = 10
 local batch_size = 1
 
+local senna = torch.load('senna.t7')
 local train = torch.load('train.t7')
 local iter = 1
 
@@ -156,7 +159,7 @@ local function glorot(W)
   return W:uniform(-bound, bound)
 end
 
-model.lookup.weight:uniform(-0.1, 0.1)
+model.lookup.weight:zero():add(senna)
 for l = 1, #model.layers do
   model.initial[l].weight:zero()
 end

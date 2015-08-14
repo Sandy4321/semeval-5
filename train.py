@@ -66,10 +66,11 @@ if __name__ == '__main__':
 
         for t in xrange(x.shape[1]):
             if attention:
-                attn_mem = np.outer(np.ones(x.shape[0]), ht)
+                attn_mem = np.outer(np.ones(x.shape[0]), ht) if ht.ndim == 1 else ht
                 emb = np.zeros((x.shape[0], emb_size))
                 for j in xrange(x.shape[1]):
-                    attn_score = attention_layer.forward(np.concatenate([attn_mem, emb_through_time[j]], axis=1))
+                    attn_in = np.concatenate([attn_mem, emb_through_time[j]], axis=1)
+                    attn_score = attention_layer.forward(attn_in)
                     emb = emb + attn_score * emb_through_time[j]
             else:
                 emb = emb_through_time[t]

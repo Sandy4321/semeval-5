@@ -15,12 +15,25 @@ local n_output = vocab.rel:size()
 local n_hidden = 128
 local n_epoch = 10
 local batch_size = 1
+local cuda = false
+local gpu = 0
 
 local senna = torch.load('senna.t7')
 local train = torch.load('train.t7')
 local iter = 1
 
 torch.manualSeed(123)
+
+if cuda then
+  require 'cunn'
+  require 'cutorch'
+  cutorch.setDevice(0)
+  cutorch.manualSeed(123)
+else
+  local fakecuda = require 'fakecuda'
+  fakecuda.init(true)
+end
+
 
 local function subsample(data, n)
   local subx = {}
@@ -36,38 +49,42 @@ end
 
 --train = subsample(train, 100)
 
+local function glorot(W, n_in, n_out)
+  n_in = n_in or W:size(1)
+  n_out = n_out or W:size(2)
+  local bound = torch.sqrt(6. / (n_in + n_out))
+  return W:uniform(-bound, bound)
+end
+
 local function make_rnn_layer(n_input, n_hidden)
     local x = nn.Identity()()
     local prev_c = nn.Identity()()
     local prev_h = nn.Identity()()
 
-    function new_input_sum(is_forget)
-        -- transforms input
-        local i2h_linear     = nn.Linear(n_input, n_hidden)
-        -- transforms previous timestep's output
-        local h2h_linear     = nn.Linear(n_hidden, n_hidden)
-        -- initialize
-        i2h_linear.weight:uniform(-0.1, 0.1)
-        i2h_linear.bias:zero()
-        h2h_linear.weight:eye(n_hidden):mul(0.8)
-        h2h_linear.bias:zero()
-        if is_forget then
-          h2h_linear.bias:add(1)
-        end
+    local x = nn.Identity()()
+    local prev_c = nn.Identity()()
+    local prev_h = nn.Identity()()
 
-        local i2h            = i2h_linear(x)
-        local h2h            = h2h_linear(prev_h)
-        return nn.CAddTable()({i2h, h2h})
-    end
+    local i2h_linear = nn.Linear(n_input, 4 * n_hidden)
+    local h2h_linear = nn.Linear(n_hidden, 4 * n_hidden)
+    glorot(i2h_linear.weight, n_input, n_hidden)
+    glorot(h2h_linear.weight, n_hidden, n_hidden)
+    local i2h = i2h_linear(x)
+    local h2h = h2h_linear(prev_h)
+    local all_input_sums = nn.CAddTable()({i2h, h2h})
 
-    local in_gate          = nn.Sigmoid()(new_input_sum())
-    local forget_gate      = nn.Sigmoid()(new_input_sum(true))
-    local out_gate         = nn.Sigmoid()(new_input_sum())
-    local in_transform     = nn.Tanh()(new_input_sum())
+    local sigmoid_chunk = nn.Narrow(2, 1, 3 * n_hidden)(all_input_sums)
+    sigmoid_chunk = nn.Sigmoid()(sigmoid_chunk)
+    local in_gate = nn.Narrow(2, 1, n_hidden)(sigmoid_chunk)
+    local forget_gate = nn.Narrow(2, n_hidden + 1, n_hidden)(sigmoid_chunk)
+    local out_gate = nn.Narrow(2, 2 * n_hidden + 1, n_hidden)(sigmoid_chunk)
+
+    local in_transform = nn.Narrow(2, 3 * n_hidden + 1, n_hidden)(all_input_sums)
+    in_transform = nn.Tanh()(in_transform)
 
     local next_c           = nn.CAddTable()({
-        nn.CMulTable()({forget_gate, prev_c}),
-        nn.CMulTable()({in_gate,     in_transform})
+      nn.CMulTable()({forget_gate, prev_c}),
+      nn.CMulTable()({in_gate,     in_transform})
     })
     local next_h           = nn.CMulTable()({out_gate, nn.Tanh()(next_c)})
     local output           = nn.Identity()(next_h)
@@ -129,7 +146,7 @@ local model = {
         -- predict class
         local _, pred = torch.max(output, 2)
         --print('out', output, 'loss', loss, 'pred', pred)
-        
+
         self.tape:stop()
 
         return loss, torch.eq(pred:int(), y):float():mean()
@@ -152,12 +169,7 @@ local model = {
 }
 
 -- initialize
-local function glorot(W)
-  local n_in = W:size(1)
-  local n_out = W:size(2)
-  local bound = torch.sqrt(6. / (n_in + n_out))
-  return W:uniform(-bound, bound)
-end
+
 
 model.lookup.weight:zero():add(senna)
 for l = 1, #model.layers do
@@ -168,6 +180,7 @@ model.output.bias:zero()
 
 -- define train/test functions
 local params, grads = model:get_parameters()
+params:cuda()
 
 local function fopt(x)
     if params ~= x then
@@ -178,7 +191,6 @@ local function fopt(x)
     local ind = math.ceil(math.random() * #train.X)
     local x = train.X[ind]
     local y = train.Y[ind]
-    iter = (iter % #train.X) + 1
 
     local loss, acc = model:forward(x, y)
     model:backward()
@@ -191,7 +203,7 @@ local function fpredict(data)
   local total_loss = 0
   local total_acc = 0
   for i = 1, #data.X do
-    local x = data.X[i]
+    local x = data.X[i]:cuda()
     local y = data.Y[i]
     local loss, acc = model:forward(x, y)
     total_loss = total_loss + loss
@@ -202,14 +214,14 @@ end
 
 for epoch = 1, n_epoch do
     -- train epoch
-    optim.rmsprop(fopt, params, {learningRate=1e-2})
-    xlua.progress(iter, #train.X)
-    while iter ~= 1 do
+    for iter = 1, #train.X do
       _, fx = optim.rmsprop(fopt, params, {learningRate=1e-2})
       xlua.progress(iter, #train.X)
     end
+    xlua.progress(#train.X, #train.X)
     -- evaluate
     local loss, acc = fpredict(train)
     print('epoch', epoch, 'loss', loss, 'acc', acc)
+    torch.save('params.' .. epoch .. '.t7', params)
 end
 

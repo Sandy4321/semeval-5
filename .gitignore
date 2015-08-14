@@ -1,7 +1,9 @@
 # Byte-compiled / optimized / DLL files
+senna/
+.idea
+.DS_Store
 __pycache__/
 *.py[cod]
-*.lua
 *.pkl
 *.t7
 

@@ -1,137 +1,124 @@
-import autograd.numpy as np
+from blocks.algorithms import GradientDescent, Adam
+from blocks.bricks import Linear
+from blocks.extensions import *
+from blocks.graph import ComputationGraph
+from fuel.schemes import ShuffledScheme
+from fuel.streams import DataStream
+import numpy as np
 import cPickle as pkl
-from pystacks.param import ParamServer
-from pystacks.layers.recurrent import LSTMMemoryLayer
-from pystacks.layers.embedding import LookupTable
-from pystacks.regularizers import Dropout
-from pystacks.layers.core import Dense
-from pystacks.layers.activations import LogSoftmax
-from pystacks.initialization import Hardcode
-from pystacks.optimizers import *
-from pystacks.utils.logging import Progbar
-from pystacks.grad_transformer import *
-from pystacks.utils.text import Vocab, Senna
-from pystacks.utils.math import one_hot, make_batches_by_len
+from fuel.transformers import *
 
-from pprint import pprint
-from time import time
-from autograd import value_and_grad
-from autograd.util import quick_grad_check
+from theano import tensor as T, function
+from theano.tensor.extra_ops import to_one_hot
 
-from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+from blocks.main_loop import MainLoop
+from blocks.model import Model
+from blocks import bricks
+from blocks.bricks.lookup import LookupTable
+from blocks.bricks.recurrent import LSTM
+from blocks.bricks.cost import CategoricalCrossEntropy
+from blocks import initialization
+from blocks.monitoring import aggregation
 
-def softmax(x):
-    x = x - np.max(x)
-    e = np.exp(x)
-    return e / np.sum(e, axis=-1, keepdims=True)
+from blocks.extensions.monitoring import *
+
 
 if __name__ == '__main__':
-    with open('numericalized.pkl') as f:
-        train, dev, test, word_vocab, rel_vocab = pkl.load(f)
 
     state_size = 500
     emb_size = 50
     num_epoch = 30
     learning_rate = 1.0
     batch_size = 128
-    pool = True
-    attention = True
+
+    from dataset import Vocab, Senna
+    with open('vocabs.pkl') as f:
+        vocabs = pkl.load(f)
+        word_vocab, rel_vocab = vocabs['word'], vocabs['rel']
+
+    with open('train.pkl') as f:
+        train = pkl.load(f)
 
     np.random.seed(1)
 
-    server = ParamServer()
+    # dataset
+    train_stream = DataStream(dataset=train, iteration_scheme=ShuffledScheme(examples=train.num_examples, batch_size=128))
+    train_stream = Padding(train_stream, mask_sources=('word_indices',))
+    train_stream = Mapping(train_stream, lambda data: tuple(array.T for array in data))
+    train_stream = Cast(train_stream, 'int32')
 
-    lookup_layer = LookupTable(len(word_vocab), emb_size)
-    lookup_layer.E.init = Hardcode(word_vocab.load_embeddings())
-    lookup_layer.register_params(server)
-    lstm_layer = LSTMMemoryLayer(emb_size, state_size, dropout=Dropout(0.5)).register_params(server)
+    # model
+    def build(state_size, vocab_size, output_size, emb_size=50):
+        x = T.imatrix('word_indices')
+        mask = T.imatrix('word_indices_mask')
+        y = T.ivector('relation')
 
-    rel_output_layer = Dense(state_size, len(rel_vocab)).register_params(server)
-    rel_softmax_layer = LogSoftmax().register_params(server)
+        lookup = LookupTable(
+            vocab_size, emb_size,
+            name='lookup',
+            weights_init=initialization.Uniform(0., width=0.01),
+        )
+        emb = lookup.apply(x)
 
-    attention_layer = Dense(state_size + emb_size, 1).register_params(server)
-    attention_softmax = LogSoftmax().register_params(server)
+        x_to_h = Linear(
+            emb_size, state_size*4,
+            name='x_to_h',
+            weights_init=initialization.IsotropicGaussian(0.01),
+            biases_init=initialization.Constant(0.)
+        )
+        x_transform = x_to_h.apply(emb)
 
-    server.finalize()
+        lstm = LSTM(
+            state_size,
+            weights_init=initialization.IsotropicGaussian(0.01),
+            biases_init=initialization.Constant(0.),
+            name='lstm'
+        )
+        h, c = lstm.apply(x_transform, mask=T.cast(mask, 'float32'))
 
-    def pred_fun(weights, x, train=False):
-        server.param_vector = weights
-        ht, ct = lstm_layer.h0.fetch(), lstm_layer.c0.fetch()
-        h_cache = None
+        h_to_o = Linear(
+            state_size, output_size,
+            name='output',
+            weights_init=initialization.IsotropicGaussian(0.01),
+            biases_init=initialization.Constant(0.),
+        )
 
-        emb_through_time = []
-        for t in xrange(x.shape[1]):
-            emb_through_time.append(lookup_layer.forward(x[:, t], train=train))
-        emb_through_time = np.array(emb_through_time)
+        score = h_to_o.apply(h[-1])
+        softmax = bricks.Softmax()
+        y_prob = softmax.apply(score)
 
-        for t in xrange(x.shape[1]):
-            if attention:
-                attn_mem = np.outer(np.ones(x.shape[0]), ht) if ht.ndim == 1 else ht
-                emb = np.zeros((x.shape[0], emb_size))
-                for j in xrange(x.shape[1]):
-                    attn_in = np.concatenate([attn_mem, emb_through_time[j]], axis=1)
-                    attn_score = attention_layer.forward(attn_in)
-                    emb = emb + attn_score * emb_through_time[j]
-            else:
-                emb = emb_through_time[t]
-            ht, ct = lstm_layer.forward(emb, ht, ct, train=train)
-            if pool:
-              h_cache = ht if h_cache is None else np.maximum(h_cache, ht)
-        if pool:
-          ht = h_cache
-        pt_rel = rel_output_layer.forward(ht)
-        return rel_softmax_layer.forward(pt_rel)
+        cost = CategoricalCrossEntropy().apply(to_one_hot(y, output_size), y_prob)
 
-    def loss_fun(weights, x, targets, train=False):
-        logprobs_rel = pred_fun(weights, x, train=train)
-        loss_sum = - np.sum(logprobs_rel * targets)
-        return loss_sum / float(x.shape[0])
+        for brick in [lookup, x_to_h, lstm, h_to_o]:
+            brick.initialize()
 
-    def score(weights, inputs, targets, train=False):
-        targs = np.argmax(targets, axis=-1)
-        logprobs_rel = pred_fun(weights, inputs, train)
-        preds = np.argmax(logprobs_rel, axis=-1)
-        acc = accuracy_score(targs, preds)
-        return targs, preds, acc
+        return cost
 
-    # Build gradient of loss function using autograd.
-    loss_and_grad = value_and_grad(loss_fun)
+    cost = build(state_size, len(word_vocab), len(rel_vocab))
 
-    # Check the gradients numerically, just to be safe
-    xsmall, ysmall = np.array(train[0][0]).reshape(1, -1), one_hot(np.array(train[1][0]).reshape(1, -1), len(rel_vocab))
-    quick_grad_check(loss_fun, server.param_vector, (xsmall, ysmall))
+    algorithm = GradientDescent(
+        cost=cost,
+        parameters=ComputationGraph(cost).parameters,
+        step_rule=Adam(),
+    )
 
-    def evaluate(split, name='dev'):
-        batches = make_batches_by_len([len(x) for x in split[0]], batch_size)
-        targs, preds = [], []
-        for batch in batches:
-            x, y = np.array([split[0][i] for i in batch], dtype='int32'), one_hot(np.array([split[1][i] for i in batch], dtype='int32'), len(rel_vocab))
-            targs_, preds_, acc = score(server.param_vector, x, y, train=False)
-            targs.append(targs_)
-            preds.append(preds_)
-        print name, 'acc', np.mean(np.concatenate(targs) == np.concatenate(preds))
+    train_monitor = TrainingDataMonitoring(
+        variables=[
+            cost,
+            aggregation.mean(algorithm.total_gradient_norm),
+            aggregation.mean(algorithm.total_step_norm)
+        ],
+        prefix="train", after_epoch=True)
 
-    print("Training LSTM...")
-    optimizer = Adam()
-    start = time()
-    for epoch in xrange(1, num_epoch+1):
-        epoch_loss = 0.
-        batches = make_batches_by_len([len(x) for x in train[0]], batch_size)
-        print 'epoch', epoch
-        bar = Progbar(len(train[0]), 'train', track=['loss', 'acc'])
-        for batch in batches:
-            x, y = np.array([train[0][i] for i in batch], dtype='int32'), one_hot(np.array([train[1][i] for i in batch], dtype='int32'), len(rel_vocab))
-            loss, dparams = loss_and_grad(server.param_vector, x, y, train=True)
-            epoch_loss += loss
-            server.update_params(optimizer, dparams, learning_rate)
-            targs_, preds_, acc = score(server.param_vector, x, y, train=False)
-            bar.update(len(y), new_values={'loss':loss, 'acc':acc})
-        bar.finish()
+    main_loop = MainLoop(
+        algorithm=algorithm,
+        data_stream=train_stream,
+        model=Model(cost),
+        extensions=[
+            train_monitor,
+            FinishAfter(after_n_epochs=10),
+            Printing(),
+            ProgressBar(),
+        ])
 
-        evaluate(train, 'train')
-        evaluate(test, 'test')
-
-        print("epoch %s train loss %s in %s" % (epoch, epoch_loss, time() - start))
-        start = time()
-
-    evaluate(test, 'test')
+    main_loop.run()

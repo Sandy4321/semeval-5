@@ -1,33 +1,36 @@
-from blocks.algorithms import GradientDescent, Adam
-from blocks.bricks import Linear
-from blocks.extensions import *
+from blocks.extensions.saveload import Checkpoint
+from blocks.filter import VariableFilter
 from blocks.graph import ComputationGraph
 from fuel.schemes import ShuffledScheme
 from fuel.streams import DataStream
 import numpy as np
 import cPickle as pkl
+import pprint
+import math
 from fuel.transformers import *
 
-from theano import tensor as T, function
-from theano.tensor.extra_ops import to_one_hot
-
-from blocks.main_loop import MainLoop
 from blocks.model import Model
-from blocks import bricks
-from blocks.bricks.lookup import LookupTable
-from blocks.bricks.recurrent import LSTM
-from blocks.bricks.cost import CategoricalCrossEntropy
-from blocks import initialization
-from blocks.monitoring import aggregation
-
 from blocks.extensions.monitoring import *
+
+def _transpose(data):
+    return tuple(array.T for array in data)
+
+
+def wrap_stream(name):
+    with open(name) as f:
+        dataset = pkl.load(f)
+    stream = DataStream(dataset=dataset, iteration_scheme=ShuffledScheme(examples=dataset.num_examples, batch_size=128))
+    stream = Padding(stream, mask_sources=('word_indices',))
+    stream = Mapping(stream, _transpose)
+    stream = Cast(stream, 'int32')
+    return stream
 
 
 if __name__ == '__main__':
 
     state_size = 500
     emb_size = 50
-    num_epoch = 30
+    num_epochs = 3
     learning_rate = 1.0
     batch_size = 128
 
@@ -36,89 +39,58 @@ if __name__ == '__main__':
         vocabs = pkl.load(f)
         word_vocab, rel_vocab = vocabs['word'], vocabs['rel']
 
-    with open('train.pkl') as f:
-        train = pkl.load(f)
-
     np.random.seed(1)
 
     # dataset
-    train_stream = DataStream(dataset=train, iteration_scheme=ShuffledScheme(examples=train.num_examples, batch_size=128))
-    train_stream = Padding(train_stream, mask_sources=('word_indices',))
-    train_stream = Mapping(train_stream, lambda data: tuple(array.T for array in data))
-    train_stream = Cast(train_stream, 'int32')
+    stream_train = wrap_stream('train.pkl')
+    stream_test = wrap_stream('dev.pkl')
 
-    # model
-    def build(state_size, vocab_size, output_size, emb_size=50):
-        x = T.imatrix('word_indices')
-        mask = T.imatrix('word_indices_mask')
-        y = T.ivector('relation')
+    from model import BasicModel
 
-        lookup = LookupTable(
-            vocab_size, emb_size,
-            name='lookup',
-            weights_init=initialization.Uniform(0., width=0.01),
-        )
-        emb = lookup.apply(x)
+    model = BasicModel(state_size, len(word_vocab), len(rel_vocab))
+    cg = ComputationGraph(model.cost)
 
-        x_to_h = Linear(
-            emb_size, state_size*4,
-            name='x_to_h',
-            weights_init=initialization.IsotropicGaussian(0.01),
-            biases_init=initialization.Constant(0.)
-        )
-        x_transform = x_to_h.apply(emb)
+    bricks_model = Model(model.cost)
+    for brick in bricks_model.get_top_bricks():
+        brick.initialize()
 
-        lstm = LSTM(
-            state_size,
-            weights_init=initialization.IsotropicGaussian(0.01),
-            biases_init=initialization.Constant(0.),
-            name='lstm'
-        )
-        h, c = lstm.apply(x_transform, mask=T.cast(mask, 'float32'))
+    # summary of what's going on
+    parameters = bricks_model.get_parameter_dict()
+    logger.info("Parameters:\n" +
+                pprint.pformat(
+                    [(key, value.get_value().shape, value.get_value().mean()) for key, value
+                     in parameters.items()],
+                    width=120))
 
-        h_to_o = Linear(
-            state_size, output_size,
-            name='output',
-            weights_init=initialization.IsotropicGaussian(0.01),
-            biases_init=initialization.Constant(0.),
-        )
+    from blocks.algorithms import *
+    from blocks.extensions.monitoring import *
+    from blocks.main_loop import MainLoop
+    from blocks.extensions import *
+    algorithm = GradientDescent(cost=model.cost, parameters=cg.parameters, step_rule=Adam())
 
-        score = h_to_o.apply(h[-1])
-        softmax = bricks.Softmax()
-        y_prob = softmax.apply(score)
+    # Fetch variables useful for debugging
+    observables = [model.cost, model.acc, algorithm.total_step_norm, algorithm.total_gradient_norm ]
+    for name, parameter in parameters.items():
+        observables.append(named_copy(parameter.norm(2), name + "_norm"))
+        observables.append(named_copy(algorithm.gradients[parameter].norm(2), name + "_grad_norm"))
 
-        cost = CategoricalCrossEntropy().apply(to_one_hot(y, output_size), y_prob)
+    train_monitor = TrainingDataMonitoring(variables=observables, prefix="train", after_batch=True)
+    test_monitor = DataStreamMonitoring(variables=[model.cost, model.acc], data_stream=stream_test, prefix="test")
 
-        for brick in [lookup, x_to_h, lstm, h_to_o]:
-            brick.initialize()
-
-        return cost
-
-    cost = build(state_size, len(word_vocab), len(rel_vocab))
-
-    algorithm = GradientDescent(
-        cost=cost,
-        parameters=ComputationGraph(cost).parameters,
-        step_rule=Adam(),
-    )
-
-    train_monitor = TrainingDataMonitoring(
-        variables=[
-            cost,
-            aggregation.mean(algorithm.total_gradient_norm),
-            aggregation.mean(algorithm.total_step_norm)
-        ],
-        prefix="train", after_epoch=True)
+    average_monitoring = TrainingDataMonitoring(
+            observables, prefix="average", every_n_batches=10)
 
     main_loop = MainLoop(
-        algorithm=algorithm,
-        data_stream=train_stream,
-        model=Model(cost),
-        extensions=[
-            train_monitor,
-            FinishAfter(after_n_epochs=10),
-            Printing(),
-            ProgressBar(),
-        ])
-
+            model=bricks_model,
+            data_stream=stream_train,
+            algorithm=algorithm,
+            extensions=[
+                Timing(),
+                train_monitor,
+                test_monitor,
+                average_monitoring,
+                FinishAfter(after_n_epochs=num_epochs),
+                Checkpoint('model.save', every_n_batches=500,
+                           save_separately=["model", "log"]),
+                Printing(every_n_epochs=1)])
     main_loop.run()

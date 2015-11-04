@@ -1,67 +1,103 @@
 __author__ = 'victor'
-import theano.tensor as T
-from theano import function
+import numpy as np
+import theano
+from theano import tensor as T
 from theano.tensor.extra_ops import to_one_hot
-from blocks.bricks import *
-from blocks.model import *
-from blocks.bricks.lookup import *
 from blocks.initialization import *
-from blocks.bricks.recurrent import *
-from blocks.bricks.cost import *
+from blocks.bricks.lookup import LookupTable
+from blocks.bricks.recurrent import LSTM
+from blocks.bricks import *
+from blocks.bricks.cost import CategoricalCrossEntropy
 
-class BasicModel(object):
 
-    def __init__(self, state_size, vocab_size, output_size, emb_size=50):
-        x = T.imatrix('word_indices')
-        mask = T.imatrix('word_indices_mask')
+class LSTMModel(object):
+
+    def __init__(self, n_vocab, n_mem, n_class, n_emb=50):
+        x1 = T.imatrix('parse1')
+        x2 = T.imatrix('parse2')
+        mask1 = T.imatrix('parse1_mask')
+        mask2 = T.imatrix('parse2_mask')
         y = T.ivector('relation')
 
         lookup = LookupTable(
-            vocab_size, emb_size,
+            n_vocab, n_emb,
             name='lookup',
             weights_init=Uniform(0., width=0.01),
         )
-        emb = lookup.apply(x)
+        emb1 = lookup.apply(x1)
+        emb2 = lookup.apply(x2)
 
-        x_to_h = Linear(
-            emb_size, state_size*4,
-            name='x_to_h',
+        trans1 = Linear(
+            n_emb, n_mem*4,
+            name='emb_to_h1',
             weights_init=IsotropicGaussian(0.1),
             biases_init=Constant(0.)
-        )
-        x_transform = x_to_h.apply(emb)
+        ).apply(emb1)
+        trans2 = Linear(
+            n_emb, n_mem*4,
+            name='emb_to_h2',
+            weights_init=IsotropicGaussian(0.1),
+            biases_init=Constant(0.)
+        ).apply(emb2)
 
-        lstm = LSTM(
-            state_size,
+        h1, c1 = LSTM(
+            n_mem,
             weights_init=IsotropicGaussian(0.1),
             biases_init=Constant(0.),
-            name='lstm'
-        )
-        h, c = lstm.apply(x_transform, mask=T.cast(mask, 'float32'))
+            name='lstm1'
+        ).apply(trans1, mask=T.cast(mask1, theano.config.floatX))
 
-        h_to_o = Linear(
-            state_size, output_size,
+        h2, c2 = LSTM(
+            n_mem,
+            weights_init=IsotropicGaussian(0.1),
+            biases_init=Constant(0.),
+            name='lstm2'
+        ).apply(trans2, mask=T.cast(mask2, theano.config.floatX))
+
+        h_concat = T.concatenate([h1[-1], h2[-1]], axis=-1)
+
+        # debugging
+        self.x1, self.x2, self.mask1, self.mask2 = x1, x2, mask1, mask2
+        self.trans1, self.trans2 = trans1, trans2
+        self.emb1, self.emb2, self.h1, self.h2, self.h_concat = emb1, emb2, h1, h2, h_concat
+
+        score = Linear(
+            2 * n_mem, n_class,
             name='output',
             weights_init=IsotropicGaussian(0.1),
             biases_init=Constant(0.),
-        )
+        ).apply(h_concat)
 
-        score = h_to_o.apply(h[-1])
-        softmax = Softmax()
         epsilon = 1e-7
-        y_prob = softmax.apply(T.clip(score, epsilon, 1-epsilon))
+        self.y_prob = Softmax().apply(T.clip(score, epsilon, 1-epsilon))
 
-        self.cost = CategoricalCrossEntropy().apply(to_one_hot(y, output_size), y_prob)
+        self.cost = CategoricalCrossEntropy().apply(to_one_hot(y, n_class), self.y_prob)
         self.cost.name = 'CrossEntropyCost'
 
-        eq = T.eq(y_prob.argmax(axis=-1), y)
+        eq = T.eq(self.y_prob.argmax(axis=-1), y)
         self.acc = T.cast(eq, 'float32').mean()
         self.acc.name = 'Accuracy'
 
-        self.x, self.y = x, y
-        self.lookup, self.x_to_h, self.lstm, self.h_to_o = lookup, x_to_h, lstm, h_to_o
-        # self.debug_emb = function([x], emb)
-        # self.debug_x_transform = function([x], x_transform)
-        # self.debug_h = function([x, mask], h)
-        # self.debug_score = function([x, mask], [score, y_prob])
-        # self.debug_cost = function([x, mask, y], self.cost)
+        self.lookup = lookup
+
+if __name__ == '__main__':
+    model = LSTMModel(10, 10, 5)
+    print('debugging {}'.format(model))
+
+    print(model.h1.eval({
+        model.x1: np.array([[1, 2, 3], [3, 4, 3]], dtype='int32'),
+        model.mask1: np.array([[1, 1, 0], [1, 1, 1]], dtype='int32'),
+    }).shape)
+
+    print(model.h2.eval({
+        model.x2: np.array([[2, 3, 4], [1, 0, 2], [0, 2, 1]], dtype='int32'),
+        model.mask2: np.array([[1, 1, 1], [1, 0, 0], [1, 1, 1]], dtype='int32')
+    }).shape)
+
+    print(model.h_concat.eval({
+        model.x1: np.array([[1, 2, 3], [3, 4, 3]], dtype='int32'),
+        model.mask1: np.array([[1, 1, 0], [1, 1, 1]], dtype='int32'),
+        model.x2: np.array([[2, 3, 4], [1, 0, 2], [0, 2, 1]], dtype='int32'),
+        model.mask2: np.array([[1, 1, 1], [1, 0, 0], [1, 1, 1]], dtype='int32')
+    }).shape)
+
